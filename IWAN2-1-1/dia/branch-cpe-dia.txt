@@ -1,0 +1,599 @@
+!---------------------------------------------------------------------------------
+! BRANCH - DIA
+!
+! NOTES:
+!   - Block default route from DMVPN tunnels
+!   - Egress: Default route points to physical INET interface
+!   - Ingress: PBR from F-VRF to global
+!   - Enable NAT
+!   - Enable ZBFW
+!
+! DIA is usually configured over an INET interface
+! But can also be enabled over a MPLS path to access SP services.
+!
+!
+! SERVICE MODEL
+! -------------
+!
+!   Global:
+!     DIA_STATE: on/off DIA for all sites
+!     DIA_INT: MPLS or INET interface
+!         => $BR_WAN (default: INET)
+!         => Corresponding tunnel => $TUNNEL_INT
+!
+!   Per site:
+!     DIA_SITE_STATE: on/off DIA for this site
+!
+!---------------------------------------------------------------------------------
+!
+!
+!=================================================================================
+! MANAGING DEFAULT ROUTE
+!
+! NOTE:
+!   - Filter central default route coming from central sites
+!   - Configure new default route for outbound traffic
+!   - Configure PBR for returning ingress traffic
+!
+!=================================================================================
+!
+!
+!------------------------------------------------------------
+! FILTER LEARNED CENTRAL DEFAULT ROUTE
+!
+! With DIA routing, the default route is locally configured
+! for the global routing table.
+! It is important to filter the default route originating
+! over the Internet-facing DMVPN tunnel from the central site.
+! Failover to the central site is optional over the MPLS-based DMVPN tunnel.
+!
+!------------------------------------------------------------
+!
+! Option 1: EIGRP on the WAN
+! --------------------------
+!
+ip access-list standard ALL-EXCEPT-DEFAULT
+ deny 0.0.0.0
+ permit any
+!
+route-map BLOCK-DEFAULT permit 10
+ description block only the default route inbound from the WAN
+ match ip address ALL-EXCEPT-DEFAULT
+!
+!
+! Apply the policy as an inbound distribute list
+! for the Internet-facing DMVPN tunnel interface
+!
+router eigrp IWAN-EIGRP
+ address-family ipv4 unicast autonomous-system 1
+  topology base
+   distribute-list route-map BLOCK-DEFAULT in $TUNNEL_INT
+!
+! Optional:
+! If you do not want fallback to centralized Internet,
+! also apply the policy as an inbound distribute list
+! for the remaining DMVPN tunnel interfaces
+!
+!
+!
+! Option2 - BGP on the WAN
+! ------------------------
+!
+ip prefix-list ALL-EXCEPT-DEFAULT seq 10 permit 0.0.0.0/0
+!
+route-map BLOCK-DEFAULT deny 10
+ description Block only the default route inbound from the WAN
+ match ip address prefix-list ALL-EXCEPT-DEFAULT
+!
+route-map BLOCK-DEFAULT permit 100
+ description Permit all other routes
+!
+router bgp 65100
+ address-family ipv4
+  neighbor INET-HUB route-map BLOCK-DEFAULT in
+!
+! Optional:
+! (Optional) If you do not want fallback to centralized Internet,
+! also apply the policy as an inbound route- map
+! for the remaining DMVPN tunnel interfaces
+!
+router bgp 65100
+ address-family ipv4
+  neighbor MPLS-HUB route-map BLOCK-DEFAULT in
+!
+!
+!
+!------------------------------------------------------------
+! DEFAULT ROUTE
+!
+! Configure local default routing for DIA
+!
+! Internal traffic is in the global table and needs to route
+! to the Internet via the MPLS or INET interface in the Front-door VRF.
+! This configuration allows traffic to traverse from the global VRF
+! to the outside VRF in DMVPN F-VRF configurations used for IWAN.
+!
+!------------------------------------------------------------
+!
+<IF TRANSPORT=INET>
+!
+! INET PATH
+! ---------
+! Gateway learnt from DHCP
+!
+ip route 0.0.0.0 0.0.0.0 $BR_WAN dhcp 10
+!
+<ELSE>
+!
+! MPLS PATH
+! ---------
+! Gateway defined by user
+!
+ip route 0.0.0.0 0.0.0.0 $BR_WAN $BR_WAN_GW 10
+!
+<ENDIF>
+!
+!
+!
+!
+!
+!------------------------------------------------------------
+! PBR FOR INGRESS TRAFFIC
+!
+! Traffic returning to the outside NAT address
+! of the router WAN interface will be contained
+! inside the Front-door VRF.
+! The local policy configuration allows this traffic
+! to be routed back to the global table.
+!
+!------------------------------------------------------------
+!
+! Configure an ACL that matches the summary range
+! of the internal IP networks.
+!
+ip access-list extended INTERNAL-NETS
+ permit ip any $SITE_PREFIX $SITE_PREFIX_BITMASK
+!
+!
+! Create a route map that references the ACL
+! and changes the traffic to the global table
+!
+route-map INET-INTERNAL permit 10
+ description Return routing for Local Internet Access
+ match ip address INTERNAL-NETS
+ set global
+!
+!
+interface $BR_WAN
+ ip policy route-map INET-INTERNAL
+!
+!
+!
+!
+!------------------------------------------------------------
+! CONFIGURATION FOR:
+!   - SINGLE CPE WITH LAYER3 DISTRIBUTION
+!   - DUAL CPE (config on both routers)
+!
+! Configuring outbound filtering
+! Configuring static route redistribution in IGP
+!------------------------------------------------------------
+!
+!
+! Outbound filtering of the default route to the WAN
+! --------------------------------------------------
+!
+! Option1 - EIGRP on the LAN
+! --------------------------
+!
+ip access-list standard DEFAULT-ONLY
+ permit 0.0.0.0
+!
+route-map ROUTE-LIST deny 10
+ description Block Local Internet Default route out to the WAN
+ match ip address DEFAULT-ONLY
+!
+route-map ROUTE-LIST permit 100
+ description Advertise all other routes
+!
+!
+router eigrp IWAN-EIGRP
+ address-family ipv4 unicast autonomous-system 1
+  topology base
+   distribute-list route-map ROUTE-LIST out $TUNNEL_INT
+  exit-af-topology
+ exit-address-family
+!
+!
+! Option2 - BGP on WAN and OSPF on LAN
+! ------------------------------------
+!
+ip prefix-list ALL-EXCEPT-DEFAULT seq 10 permit 0.0.0.0/0
+!
+route-map SPOKE-OUT deny 20
+ description Block only the default route outbound from the WAN
+ match ip address prefix-list ALL-EXCEPT-DEFAULT
+!
+route-map SPOKE-OUT permit 1000
+ description Permit all other routes
+!
+router bgp 65100
+ address-family ipv4
+  neighbor HUB-X route-map SPOKE-OUT out
+ exit-address-family
+!
+!
+!
+!
+!
+! Redistribute Static default route into LAN routing protocol
+! -----------------------------------------------------------
+!
+! Option1 - EIGRP on the LAN
+! --------------------------
+!
+ip access-list standard DEFAULT-ONLY
+ permit 0.0.0.0
+!
+route-map STATIC-IN permit 10
+ description Redistribute local default route
+ match ip address DEFAULT-ONLY
+!
+router eigrp IWAN-EIGRP
+ address-family ipv4 unicast autonomous-system 1
+  topology base
+   redistribute static route-map STATIC-IN
+  exit-af-topology
+ exit-address-family
+!
+!
+! Option2 - BGP on WAN and OSPF on LAN
+! ------------------------------------
+!
+ip access-list standard DEFAULT-ONLY
+ permit 0.0.0.0
+!
+route-map STATIC-IN permit 10
+ description Redistribute local default route
+ match ip address DEFAULT-ONLY
+!
+router bgp 65100
+ address-family ipv4
+  redistribute static route-map STATIC-IN
+ exit-address-family
+!
+!
+!
+!
+!
+!
+!=================================================================================
+! CONFIGURE NAT FOR DIA
+!
+! NOTES
+!   - Perform these configurations on the router supporting DIA
+!   - Over the WAN interface where DIA is used.
+!
+!=================================================================================
+!
+ip access-list extended NAT-LOCAL
+ permit ip $SITE_PREFIX $SITE_PREFIX_BITMASK any
+ deny   ip any any
+!
+route-map NAT-PATH permit 10
+ match ip address NAT-LOCAL
+ match interface $BR_WAN
+!
+ip nat inside source route-map NAT-PATH interface $BR_WAN overload
+!
+!
+! WAN Interface
+! -------------
+!
+interface $BR_WAN
+ ip nat outside
+!
+!
+! Case #1 - No VLAN used
+! ----------------------
+!
+interface $BR_LAN
+ ip nat inside
+!
+!
+! Case #2 - VLAN Used
+! -------------------
+!
+interface $BR_LAN.$VLAN_DATA
+! Example: GigabitEthernet0/0/3.10
+ description DATA VLAN
+ ip nat inside
+!
+interface $BR_LAN.$VLAN_VOICE
+! Example: GigabitEthernet0/0/3.11
+ description VOICE VLAN
+ ip nat inside
+!
+interface $BR_LAN.$VLAN_GUEST
+! Example: GigabitEthernet0/0/3.12
+ description GUEST VLAN
+ ip nat inside
+!
+!
+!
+!
+!=================================================================================
+! CONFIGURE ZBFW FOR DIA
+!
+! NOTE
+!   - Perform these configurations on the router supporting DIA
+!   - Configuration updated from CVD to allow PNP packets to go thru
+!   - $PNP_PORT used in the filtering rules - 9191 by default
+!
+!=================================================================================
+!
+!
+!---------------------------------------------------------------------------------
+! CONFIGURE BASE IOS ZONE-BASE FIREWALL PARAMETERS
+!---------------------------------------------------------------------------------
+!
+!
+! Define Security Zones
+! ---------------------
+!
+zone security default
+zone security OUTSIDE
+!
+!
+! Define a class map to match specific protocols
+! ---------------------------------------------
+!
+class-map type inspect match-any INSIDE-TO-OUTSIDE-CLASS
+ match protocol ftp
+ match protocol tcp
+ match protocol udp
+ match protocol icmp
+!
+!
+! A policy is an association of traffic classes and actions.
+! ----------------------------------------------------------
+! It specifies what actions should be performed on defined traffic classes.
+! In this case, you statefully inspect the outbound session so that return traffic is permitted.
+!
+policy-map type inspect INSIDE-TO-OUTSIDE-POLICY
+ class type inspect INSIDE-TO-OUTSIDE-CLASS
+  inspect
+ class class-default
+  drop
+!
+!
+! Define the zone pair and apply the policy map.
+! ----------------------------------------------
+! A zone pair represents two defined zones and identifies the source and destination zones
+! where a unidirectional firewall policy-map is applied.
+! This configuration uses only one zone pair because all traffic is inspected and thus allowed to return.
+!
+zone-pair security IN_OUT source default destination OUTSIDE
+ service-policy type inspect INSIDE-TO-OUTSIDE-POLICY
+!
+!
+!
+!---------------------------------------------------------------------------------
+! RESTRICT TRAFFIC TO THE ROUTER
+!
+! Cisco IOS defines the router by using the fixed-name self as a separate security zone.
+! The self-zone is the exception to the default deny-all policy.
+! All traffic destined to or originating from the router itself (local traffic)
+! on any interface is allowed until traffic is explicitly denied.
+!
+!---------------------------------------------------------------------------------
+!
+!
+! Allowing traffic with a destination of the router itself from the OUTSIDE zone
+! This traffic can be inspected
+! ------------------------------------------------------------------------------
+!
+ip access-list extended ACL-RTR-IN
+ permit udp any any eq non500-isakmp
+ permit udp any any eq isakmp
+ permit icmp any any echo
+ permit icmp any any echo-reply
+ permit icmp any any ttl-exceeded
+ permit icmp any any port-unreachable
+ permit udp any any gt 1023 ttl eq 1
+!
+!
+! Identify traffic for IPSEC tunnel initiation and other traffic that will originate
+! from the router (self-zone) to the OUTSIDE zone.
+! This traffic can be inspected.
+! ----------------------------------------------------------------------------------
+!
+ip access-list extended ACL-RTR-OUT
+ permit udp any any eq non500-isakmp
+ permit udp any any eq isakmp
+ permit icmp any any
+ permit udp any any eq domain
+!
+!
+! Allow the router to acquire a public IP address dynamically from the ISP
+! This traffic cannot be inspected
+! ------------------------------------------------------------------------
+!
+ip access-list extended DHCP-IN
+ permit udp any eq bootps any eq bootpc
+!
+ip access-list extended DHCP-OUT
+ permit udp any eq bootpc any eq bootps
+!
+!
+!
+! Configure the ESP ACL to allow the router to establish IPSEC communications for DMVPN.
+! -------------------------------------------------------------------------------------
+! ESP needs to be explicitly allowed inbound and outbound in separate ACLs.
+! ESP cannot be inspected.
+!
+ip access-list extended ESP-IN
+ permit esp any any
+!
+ip access-list extended ESP-OUT
+ permit esp any any
+!
+ip access-list extended GRE-IN
+ permit gre any any
+!
+!
+! Configure the ACL to allow PnP
+! ------------------------------
+! Needs to be explicitly allowed inbound and outbound in separate ACLs
+!
+ip access-list extended PNP-IN
+ permit tcp any eq $PNP_PORT any
+!
+ip access-list extended PNP-OUT
+ permit tcp any any eq $PNP_PORT
+!
+!
+!
+! class-map matching inbound traffic that can be inspected
+! --------------------------------------------------------
+!
+class-map type inspect match-any INSPECT-ACL-IN-CLASS
+ match access-group name ACL-RTR-IN
+!
+!
+! class-map matching outbound traffic that can be inspected
+! --------------------------------------------------------
+!
+class-map type inspect match-any INSPECT-ACL-OUT-CLASS
+ match access-group name ACL-RTR-OUT
+!
+!
+! class-map matching inbound traffic that cannot be inspected
+! -----------------------------------------------------------
+!
+class-map type inspect match-any PASS-ACL-IN-CLASS
+ match access-group name DHCP-IN
+ match access-group name ESP-IN
+ match access-group name GRE-IN
+ match access-group name PNP-IN
+!
+!
+! class-map matching outbound traffic that cannot be inspected
+! -----------------------------------------------------------
+!
+class-map type inspect match-any PASS-ACL-OUT-CLASS
+ match access-group name DHCP-OUT
+ match access-group name ESP-OUT
+ match access-group name PNP-OUT
+!
+!
+!
+! Inbound policy-map
+! ------------------
+!
+! Note: make sure PASS-ACL-IN-CLASS is before INSPECT-ACL-IN-CLASS for PnP
+!
+policy-map type inspect ACL-IN-POLICY
+ class type inspect PASS-ACL-IN-CLASS
+  pass
+ class type inspect INSPECT-ACL-IN-CLASS
+  inspect
+ class class-default
+  drop
+!
+!
+! Outbound policy-map
+! -------------------
+!
+! Note: make sure PASS-ACL-OUT-CLASS is before INSPECT-ACL-OUT-CLASS for PnP
+!
+policy-map type inspect ACL-OUT-POLICY
+ class type inspect PASS-ACL-OUT-CLASS
+  pass
+ class type inspect INSPECT-ACL-OUT-CLASS
+  inspect
+ class class-default
+  drop
+!
+!
+! Define the zone pair and apply policy maps to them
+! --------------------------------------------------
+!
+zone-pair security TO-ROUTER source OUTSIDE destination self
+service-policy type inspect ACL-IN-POLICY
+!
+zone-pair security FROM-ROUTER source self destination OUTSIDE
+ service-policy type inspect ACL-OUT-POLICY
+!
+!
+!
+!
+!---------------------------------------------------------------------------------
+! APPLY ZBFW ON WAN INTERFACE
+!
+! NOTE:
+!   - Remove the existing ACL
+!   - Add ZBFW
+!---------------------------------------------------------------------------------
+!
+! Remove the existing ACL
+! -----------------------
+!
+interface $BR_WAN
+ no ip access-list ACL-INET-PUBLIC in
+!
+! Add ZBFW to the interface used for DIA
+! --------------------------------------
+!
+interface $BR_WAN
+ zone-member security OUTSIDE
+!
+!
+!
+!
+!
+!=================================================================================
+! CONFIGURE DIA ISP BLACKHOLE ROUTING DETECTION
+!
+! NOTE
+!   Perform these configurations
+!   on the router supporting DIA
+!
+! OPTION1 - DMVPN Tunnel State Tracking
+!   The DMVPN tunnel state is used to monitor the status
+!   of the ISP connection used as the primary path
+!   for local Internet traffic.
+!   If it goes down, remove default route to DIA
+!
+!=================================================================================
+!
+track 80 interface $TUNNEL_INT line-protocol
+ delay up 20
+!
+event manager applet DISABLE-IWAN-DIA-DEFAULT
+ description ISP Black hole Detection - Tunnel state
+ event track 80 state down
+ action 1 cli command "enable"
+ action 2 cli command "configure terminal"
+ action 3 cli command "no ip route 0.0.0.0 0.0.0.0 $BR_WAN dhcp 10"
+ action 10 cli command "end"
+ action 99 syslog msg "IWAN DIA DEFAULT IP ROUTE via $BR_WAN DISABLED"
+!
+event manager applet ENABLE-IWAN-DIA-DEFAULT
+ description ISP Black hole Detection - Tunnel state
+ event track 80 state up
+ action 1 cli command "enable"
+ action 2 cli command "configure terminal"
+ action 3 cli command "ip route 0.0.0.0 0.0.0.0 $BR_WAN dhcp 10"
+ action 10 cli command "end"
+ action 99 syslog msg "IWAN DIA DEFAULT IP ROUTE via $BR_WAN ENABLED"
+!
+!
+!
+!
+!
+!
+!
+!
+!
+!---END---

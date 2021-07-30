@@ -1,0 +1,28 @@
+!------------------------------------------------------------------------
+! CENTRAL SITE
+! MC
+!
+! Host the SD-AVC container
+! Primary SD-AVC on the Hub MC. Serves all central CPEs (from all DCs)
+! Standby SD-AVC could be on a Transit MC
+!
+!------------------------------------------------------------------------
+
+! EXEC mode
+! CLI Commands on the central Master Controller
+
+!---------------------------------------------------------------------------------------
+! VARIABLES
+!
+! OVA_FILE: SD-AVC ova file used for installation
+! DISK: point to harddisk and specify the working/extracting disk for the OVA.
+! MC_LAN: is the interface the SD-AVC service IP subnet belong to
+! SD-AVC-IP: IP address belongs to one of the router interfaces subnets
+             This subnet should be advertised and be reachable from the HUB routers
+!---------------------------------------------------------------------------------------
+
+service sd-avc install package bootflash:$OVA_FILE media $DISK
+service sd-avc configure gateway-ip interface $MC_LAN service-ip $MC_LAN_IP activate
+
+
+---END---
